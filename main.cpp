@@ -7,11 +7,9 @@
 #include <random>
 #include <string>
 #include <atomic>
-#include <algorithm> // For std::swap
-#include <sstream>   // For std::stringstream
-#include <iomanip>   // For std::fixed and std::setprecision
-
-// --- Structure Definitions and Global State ---
+#include <algorithm> 
+#include <sstream>   
+#include <iomanip>   
 
 struct DungeonInstance {
     int id;
@@ -127,7 +125,6 @@ int main() {
 void input_handler() {
     const std::string thread_name = "InputHandler";
     
-    // --- Phase 1: Wait for initial queue to be processed ---
     {
         std::unique_lock<std::mutex> lock(g_mutex);
         if (!is_simulation_idle()) {
@@ -135,13 +132,12 @@ void input_handler() {
         }
     }
 
-    // --- Phase 2: Manual Control Loop ---
     log_message(thread_name, "----------------------------------------");
     log_message(thread_name, "Initial queue processed. Entering Manual Control.");
     
     std::string line;
     while (simulation_running) {
-        // <<< CHANGE: Read current queue state to display in the prompt >>>
+
         int current_tanks, current_healers, current_dps;
         {
             std::lock_guard<std::mutex> lock(g_mutex);
