@@ -7,9 +7,11 @@
 #include <random>
 #include <string>
 #include <atomic>
-#include <algorithm> 
-#include <sstream>   
-#include <iomanip>   
+#include <algorithm> // For std::swap
+#include <sstream>   // For std::stringstream
+#include <iomanip>   // For std::fixed and std::setprecision
+
+// --- Structure Definitions and Global State ---
 
 struct DungeonInstance {
     int id;
@@ -27,23 +29,24 @@ int max_time;
 
 std::vector<DungeonInstance> instances;
 std::atomic<int> active_parties(0);
-bool all_players_queued = false;
 
+// --- Synchronization Primitives ---
 std::mutex g_mutex;
 std::condition_variable cv;
 std::mutex rng_mutex;
-std::mutex cout_mutex; 
+std::mutex cout_mutex;
 
-std::chrono::steady_clock::time_point start_time; 
+// --- Time, Logging, and Shutdown Signal ---
+std::chrono::steady_clock::time_point start_time;
+std::atomic<bool> simulation_running(true);
 
+// Thread-safe logging function
 void log_message(const std::string& thread_name, const std::string& message) {
     std::lock_guard<std::mutex> lock(cout_mutex);
-    
     auto now = std::chrono::steady_clock::now();
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - start_time);
     double seconds = elapsed.count() / 1000.0;
-
-    std::cout << "[" << std::fixed << std::setw(8) << std::setprecision(3) << seconds << "s] "
+    std::cout << "\n[" << std::fixed << std::setw(8) << std::setprecision(3) << seconds << "s] "
               << "[" << std::setw(15) << thread_name << "] "
               << message << std::endl;
 }
@@ -51,11 +54,13 @@ void log_message(const std::string& thread_name, const std::string& message) {
 // --- Forward Declarations ---
 void dungeon_run(int instance_id);
 void party_former();
-void print_status(const std::string& thread_name); 
+void input_handler();
+void print_status(const std::string& thread_name);
 bool can_form_party();
 int find_free_instance();
+bool is_simulation_idle();
 
-// --- Function Implementations (with logging changes) ---
+// --- Function Implementations ---
 
 int get_random_time() {
     static std::random_device rd;
@@ -66,23 +71,20 @@ int get_random_time() {
 }
 
 int main() {
-    start_time = std::chrono::steady_clock::now(); // <<< CHANGE: Initialize start time
+    start_time = std::chrono::steady_clock::now();
     const std::string thread_name = "MainThread";
 
+    // --- Input ---
     int n;
     log_message(thread_name, "--- LFG Dungeon Queue Simulator ---");
-    std::cout << "Enter max number of concurrent instances (n): ";
-    std::cin >> n;
-    std::cout << "Enter number of tanks in queue (t): ";
-    std::cin >> tank_queue;
-    std::cout << "Enter number of healers in queue (h): ";
-    std::cin >> healer_queue;
-    std::cout << "Enter number of DPS in queue (d): ";
-    std::cin >> dps_queue;
-    std::cout << "Enter minimum dungeon time in seconds (t1): ";
-    std::cin >> min_time;
-    std::cout << "Enter maximum dungeon time in seconds (t2): ";
-    std::cin >> max_time;
+    std::cout << "Enter max number of concurrent instances (n): "; std::cin >> n;
+    std::cout << "Enter number of tanks in queue (t): "; std::cin >> tank_queue;
+    std::cout << "Enter number of healers in queue (h): "; std::cin >> healer_queue;
+    std::cout << "Enter number of DPS in queue (d): "; std::cin >> dps_queue;
+    std::cout << "Enter minimum dungeon time in seconds (t1): "; std::cin >> min_time;
+    std::cout << "Enter maximum dungeon time in seconds (t2): "; std::cin >> max_time;
+    
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
     if (min_time > max_time) {
         log_message(thread_name, "Warning: Min time > Max time. Swapping values.");
@@ -90,35 +92,24 @@ int main() {
     }
     
     log_message(thread_name, "----------------------------------------");
-
-    for (int i = 0; i < n; ++i) {
-        instances.emplace_back(i);
-    }
+    for (int i = 0; i < n; ++i) instances.emplace_back(i);
     
     std::stringstream ss;
     ss << "Initial Queue: " << tank_queue << "T, " << healer_queue << "H, " << dps_queue << "D";
     log_message(thread_name, ss.str());
-    log_message(thread_name, "Initial Instance Status:");
-    print_status(thread_name);
-    log_message(thread_name, "----------------------------------------");
+    log_message(thread_name, "Starting Phase 1: Processing initial queue...");
 
+    // --- Start Simulation Threads ---
     std::thread former_thread(party_former);
+    std::thread input_thread(input_handler);
 
-    {
-        std::unique_lock<std::mutex> lock(g_mutex);
-        all_players_queued = true;
-        cv.notify_all(); 
-        cv.wait(lock, [] {
-            return active_parties == 0 && !can_form_party();
-        });
-    }
-
-    if (former_thread.joinable()) {
-        former_thread.join();
-    }
+    if (input_thread.joinable()) input_thread.join();
     
-    log_message(thread_name, "----------------------------------------");
-    log_message(thread_name, "Simulation finished. No more parties can be formed.");
+    // --- Shutdown ---
+    log_message(thread_name, "Shutdown initiated. Waiting for threads to terminate...");
+    if (former_thread.joinable()) former_thread.join();
+    
+    log_message(thread_name, "Simulation finished. All threads terminated.");
     log_message(thread_name, "--- Final Instance Summary ---");
     for (const auto& instance : instances) {
         ss.str(""); ss.clear();
@@ -133,26 +124,109 @@ int main() {
     return 0;
 }
 
+void input_handler() {
+    const std::string thread_name = "InputHandler";
+    
+    // --- Phase 1: Wait for initial queue to be processed ---
+    {
+        std::unique_lock<std::mutex> lock(g_mutex);
+        if (!is_simulation_idle()) {
+             cv.wait(lock, is_simulation_idle);
+        }
+    }
+
+    // --- Phase 2: Manual Control Loop ---
+    log_message(thread_name, "----------------------------------------");
+    log_message(thread_name, "Initial queue processed. Entering Manual Control.");
+    
+    std::string line;
+    while (simulation_running) {
+        // <<< CHANGE: Read current queue state to display in the prompt >>>
+        int current_tanks, current_healers, current_dps;
+        {
+            std::lock_guard<std::mutex> lock(g_mutex);
+            current_tanks = tank_queue;
+            current_healers = healer_queue;
+            current_dps = dps_queue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(cout_mutex);
+            std::cout << "\nQueue: " << current_tanks << "T, " << current_healers << "H, " << current_dps << "D"
+                      << " | Commands: add <role> <amount> | quit\n> ";
+        }
+        
+        if (!std::getline(std::cin, line)) {
+            simulation_running = false;
+            break;
+        }
+
+        std::stringstream ss(line);
+        std::string command;
+        ss >> command;
+
+        if (command == "add") {
+            std::string role;
+            int amount;
+            ss >> role >> amount;
+
+            if (ss.fail() || amount <= 0) {
+                log_message(thread_name, "Invalid input. Usage: add <role> <amount>");
+                continue;
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(g_mutex);
+                if (role == "tank" || role == "t") tank_queue += amount;
+                else if (role == "healer" || role == "h") healer_queue += amount;
+                else if (role == "dps" || role == "d") dps_queue += amount;
+                else {
+                    log_message(thread_name, "Invalid role. Use 'tank', 'healer', or 'dps'.");
+                    continue;
+                }
+                
+                std::stringstream log_ss;
+                log_ss << "Added " << amount << " " << role << "(s). Processing...";
+                log_message(thread_name, log_ss.str());
+            }
+            cv.notify_all();
+
+            {
+                std::unique_lock<std::mutex> lock(g_mutex);
+                cv.wait(lock, is_simulation_idle);
+                log_message(thread_name, "Processing complete. Ready for next command.");
+            }
+
+        } else if (command == "quit" || command == "exit") {
+            simulation_running = false;
+        } else if (!command.empty()) {
+            log_message(thread_name, "Unknown command: '" + command + "'");
+        }
+    }
+
+    log_message(thread_name, "Shutting down.");
+    cv.notify_all();
+}
+
+
 void party_former() {
     const std::string thread_name = "PartyFormer";
     while (true) {
         std::unique_lock<std::mutex> lock(g_mutex);
         cv.wait(lock, [] {
-            bool can_make_party = can_form_party();
-            bool is_finished = (active_parties == 0 && !can_make_party && all_players_queued);
-            return (can_make_party && find_free_instance() != -1) || is_finished;
+            bool has_work_to_do = can_form_party() && find_free_instance() != -1;
+            bool is_shutting_down = !simulation_running;
+            return has_work_to_do || is_shutting_down;
         });
 
-        if (active_parties == 0 && !can_form_party()) {
-            log_message(thread_name, "No more parties can be formed. Exiting.");
+        if (!simulation_running && active_parties == 0) {
+            log_message(thread_name, "Shutdown signal received and no more work to do. Exiting.");
             return;
         }
 
-        int instance_id = find_free_instance();
-        if (can_form_party() && instance_id != -1) {
-            tank_queue--;
-            healer_queue--;
-            dps_queue -= 3;
+        while (can_form_party() && find_free_instance() != -1) {
+            int instance_id = find_free_instance();
+            tank_queue--; healer_queue--; dps_queue -= 3;
             instances[instance_id].status = "active";
             active_parties++;
 
@@ -192,7 +266,6 @@ void dungeon_run(int instance_id) {
         log_message(thread_name, ss.str());
 
         print_status(thread_name);
-        log_message(thread_name, "----------------------------------------");
     }
     
     cv.notify_all();
@@ -209,6 +282,10 @@ int find_free_instance() {
         }
     }
     return -1;
+}
+
+bool is_simulation_idle() {
+    return active_parties == 0 && !can_form_party();
 }
 
 void print_status(const std::string& thread_name) {
